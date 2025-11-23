@@ -1,0 +1,20 @@
+# Data directories
+foa_dev/
+metadata_dev/
+
+# Logs and Outputs
+logs/
+outputs/
+outputs_old/
+
+# Checkpoints
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS specific
+.DS_Store
+Thumbs.db
