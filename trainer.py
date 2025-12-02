@@ -12,6 +12,7 @@ from dataset import SELDDataset
 from model import SMRSELDWithCSPDarkNet
 from model_crnn import SELD_CRNN
 from model_conformer import SELD_Conformer
+from resnet50_model import SELD_ResNet50_Conformer
 from loss import SMRSELDLoss
 from utils import safe_torch_load
 from visualization import plot_loss_curves, visualize_loss_components, visualize_grid_predictions
@@ -71,6 +72,18 @@ def train_model(
             conf_n_layers=config.CONF_N_LAYERS,
             conf_kernel_size=config.CONF_KERNEL_SIZE,
             dropout=config.CONF_DROPOUT
+        ).to(device)
+    elif config.MODEL_TYPE == 'resnet_conformer':
+        logger.info("Initializing ResNet50-Conformer model...")
+        model = SELD_ResNet50_Conformer(
+            n_channels=config.N_CHANNELS,
+            n_mels=config.N_MELS,
+            grid_size=(train_dataset.I, train_dataset.J),
+            num_classes=config.NUM_CLASSES,
+            conf_d_model=config.RESNET_CONF_D_MODEL,
+            conf_n_heads=config.RESNET_CONF_N_HEADS,
+            conf_n_layers=config.RESNET_CONF_N_LAYERS,
+            dropout=config.RESNET_DROPOUT
         ).to(device)
     else:
         logger.info("Initializing CSPDarkNet (CNN) model...")
@@ -440,6 +453,17 @@ def test_model(
             conf_kernel_size=config.CONF_KERNEL_SIZE,
             dropout=config.CONF_DROPOUT
         ).to(device)
+    elif config.MODEL_TYPE == 'resnet_conformer':
+        model = SELD_ResNet50_Conformer(
+            n_channels=config.N_CHANNELS,
+            n_mels=config.N_MELS,
+            grid_size=(test_dataset.I, test_dataset.J),
+            num_classes=config.NUM_CLASSES,
+            conf_d_model=config.RESNET_CONF_D_MODEL,
+            conf_n_heads=config.RESNET_CONF_N_HEADS,
+            conf_n_layers=config.RESNET_CONF_N_LAYERS,
+            dropout=config.RESNET_DROPOUT
+        ).to(device)
     else:
         model = SMRSELDWithCSPDarkNet(
             n_channels=config.N_CHANNELS,
@@ -457,6 +481,7 @@ def test_model(
     logger.info(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     criterion = SMRSELDLoss(
+        loss_type=config.LOSS_TYPE,
         w_class=config.W_CLASS,
         w_aiur=config.W_AIUR,
         w_cl=config.W_CL,

@@ -36,7 +36,7 @@ class Config:
     }
     
     # Model
-    MODEL_TYPE = 'conformer' # 'cnn' (original) or 'crnn' (new)
+    MODEL_TYPE = 'resnet_conformer' # 'cnn', 'crnn', 'conformer', or 'resnet_conformer'
     NUM_CLASSES = 14
     N_CHANNELS = 4
     
@@ -53,6 +53,12 @@ class Config:
     CONF_KERNEL_SIZE = 31
     CONF_DROPOUT = 0.3
     
+    # ResNet-Conformer Hyperparameters
+    RESNET_CONF_D_MODEL = 512
+    RESNET_CONF_N_HEADS = 8
+    RESNET_CONF_N_LAYERS = 4
+    RESNET_DROPOUT = 0.3
+    
     # Training hyperparameters
     NUM_EPOCHS = 30
     BATCH_SIZE = 16
@@ -62,7 +68,7 @@ class Config:
     WEIGHT_DECAY = 1e-4
     
     # Loss weights
-    LOSS_TYPE = 'ce' # 'ce' (Cross Entropy) or 'mse' (Mean Squared Error)
+    LOSS_TYPE = 'mse' # 'ce' (Cross Entropy) or 'mse' (Mean Squared Error)
     W_CLASS = 1.0
     W_AIUR = 1.0
     W_CL = 1.0
