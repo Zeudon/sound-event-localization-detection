@@ -305,6 +305,326 @@ def plot_loss_curves(train_losses, test_losses, save_path=None):
     
     return fig
 
+
+def visualize_mask_and_preds(
+    y_pred,
+    y_true,
+    criterion,
+    epoch,
+    save_dir='train_visualizations',
+    frame_idx=None
+):
+    """
+    Visualize ground truth, predictions, and mask for both masked and truncated loss types.
+    Shows what the model is learning and what the mask/truncation is doing.
+    
+    Args:
+        y_pred: Model predictions (B, T, G, M) - logits
+        y_true: Ground truth labels (B, T, G, M) - one-hot
+        criterion: SMRSELDLoss instance
+        epoch: Current epoch number
+        save_dir: Directory to save visualizations
+        frame_idx: Optional specific frame index to visualize
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Move to CPU for visualization
+    y_pred = y_pred.detach().cpu()
+    y_true = y_true.detach().cpu()
+    
+    B, T, G, M = y_pred.shape
+    I, J = criterion.I, criterion.J
+    
+    # Find a frame with events
+    y_true_class = torch.argmax(y_true, dim=-1)  # (B, T, G)
+    background_idx = M - 1
+    
+    if frame_idx is None:
+        # Find frame with most events
+        true_event_mask = (y_true_class != background_idx).float()  # (B, T, G)
+        event_counts = true_event_mask.sum(dim=-1)  # (B, T)
+        
+        # Find frame with at least 1 event
+        valid_frames = (event_counts >= 1).nonzero(as_tuple=False)
+        
+        if len(valid_frames) == 0:
+            logger.warning("No frames with events found for mask visualization")
+            return
+        
+        # Pick the frame with most events
+        b_idx, t_idx = valid_frames[event_counts[valid_frames[:, 0], valid_frames[:, 1]].argmax()]
+        b_idx, t_idx = int(b_idx), int(t_idx)
+    else:
+        b_idx, t_idx = 0, frame_idx
+    
+    # Extract single frame
+    pred_frame = y_pred[b_idx, t_idx]  # (G, M) - logits
+    true_frame = y_true[b_idx, t_idx]  # (G, M) - one-hot
+    
+    # Convert predictions to probabilities for visualization
+    pred_probs = F.softmax(pred_frame, dim=-1)  # (G, M)
+    
+    # Reshape to grid
+    pred_grid = pred_probs.view(I, J, M)  # (I, J, M)
+    true_grid = true_frame.view(I, J, M)  # (I, J, M)
+    pred_logits_grid = pred_frame.view(I, J, M)  # (I, J, M) - for loss computation
+    
+    # Get class predictions
+    pred_class = torch.argmax(pred_grid, dim=-1)  # (I, J)
+    true_class = torch.argmax(true_grid, dim=-1)  # (I, J)
+    
+    # Get non-background activity
+    pred_nonbg = pred_grid[..., :-1].sum(dim=-1)  # (I, J)
+    true_nonbg = true_grid[..., :-1].sum(dim=-1)  # (I, J)
+    
+    # ========== Compute Mask (if using masked loss) ==========
+    mask_grid = None
+    if criterion.use_masked_loss:
+        # Get mask indices for this frame
+        true_frame_batch = true_frame.unsqueeze(0).unsqueeze(0)  # (1, 1, G, M)
+        mask_indices = criterion.get_mask_indices(true_frame_batch)
+        
+        # Create mask grid
+        mask_flat = torch.zeros(G, dtype=torch.float32)
+        mask_flat[mask_indices] = 1.0
+        mask_grid = mask_flat.view(I, J)  # (I, J)
+    
+    # ========== Compute Truncated Loss Components (if using truncated loss) ==========
+    trunc_class_grid = None
+    trunc_spatial_grid = None
+    if criterion.w_trunc_l1 > 0:
+        # Class-wise sparsity
+        probs_events = pred_grid[..., :-1]  # (I, J, M-1)
+        l1_class = torch.abs(probs_events)
+        trunc_l1_class = torch.min(l1_class, torch.tensor(criterion.trunc_thresh_class))
+        trunc_class_grid = trunc_l1_class.sum(dim=-1)  # (I, J) - sum over classes
+        
+        # Spatial sparsity
+        cell_activity = probs_events.sum(dim=-1)  # (I, J)
+        l1_spatial = torch.abs(cell_activity)
+        trunc_spatial_grid = torch.min(l1_spatial, torch.tensor(criterion.trunc_thresh_spatial))
+    
+    # ========== Create Visualization ==========
+    # Determine number of rows based on what's being visualized
+    num_rows = 2  # Always show GT and Predictions
+    if mask_grid is not None:
+        num_rows += 1
+    if trunc_class_grid is not None:
+        num_rows += 1
+    
+    fig = plt.figure(figsize=(20, 5 * num_rows))
+    gs = fig.add_gridspec(num_rows, 4, hspace=0.3, wspace=0.3)
+    
+    # Color maps
+    cmap_activity = 'YlOrRd'
+    cmap_class = 'tab20'
+    
+    current_row = 0
+    
+    # ========== Row: Ground Truth ==========
+    ax1 = fig.add_subplot(gs[current_row, 0])
+    im1 = ax1.imshow(true_nonbg.numpy(), cmap=cmap_activity, aspect='auto')
+    ax1.set_title(f'Ground Truth Activity\\n(Non-background Sum)', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Azimuth bins')
+    ax1.set_ylabel('Elevation bins')
+    plt.colorbar(im1, ax=ax1, label='Activity')
+    
+    ax2 = fig.add_subplot(gs[current_row, 1])
+    im2 = ax2.imshow(true_class.numpy(), cmap=cmap_class, aspect='auto', vmin=0, vmax=M-1)
+    ax2.set_title(f'Ground Truth Classes\\n({int((true_class != background_idx).sum())} active cells)', 
+                  fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Azimuth bins')
+    ax2.set_ylabel('Elevation bins')
+    plt.colorbar(im2, ax=ax2, label='Class ID', ticks=range(0, M, 2))
+    
+    # Comparison map
+    ax3 = fig.add_subplot(gs[current_row, 2])
+    comparison = (pred_class == true_class).float()
+    im3 = ax3.imshow(comparison.numpy(), cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+    ax3.set_title('Prediction Accuracy\\n(Green=Correct, Red=Wrong)', fontsize=12, fontweight='bold')
+    ax3.set_xlabel('Azimuth bins')
+    ax3.set_ylabel('Elevation bins')
+    plt.colorbar(im3, ax=ax3, label='Correct')
+    
+    # Statistics
+    ax4 = fig.add_subplot(gs[current_row, 3])
+    ax4.axis('off')
+    true_event_mask = (true_class != background_idx)
+    pred_event_mask = (pred_class != background_idx)
+    accuracy = (pred_class == true_class).float().mean() * 100
+    non_bg_accuracy = (pred_class[true_event_mask] == true_class[true_event_mask]).float().mean() * 100 if true_event_mask.sum() > 0 else 0
+    
+    gt_stats = f"""Ground Truth Statistics:
+    
+Total Cells: {I * J}
+Active Cells: {int(true_event_mask.sum())}
+Background Cells: {int((~true_event_mask).sum())}
+Activity Range: [{true_nonbg.min():.3f}, {true_nonbg.max():.3f}]
+
+Prediction Accuracy:
+Overall: {accuracy:.1f}%
+Non-BG: {non_bg_accuracy:.1f}%
+    """
+    ax4.text(0.1, 0.5, gt_stats, fontsize=11, verticalalignment='center', family='monospace')
+    
+    current_row += 1
+    
+    # ========== Row: Predictions ==========
+    ax5 = fig.add_subplot(gs[current_row, 0])
+    im5 = ax5.imshow(pred_nonbg.numpy(), cmap=cmap_activity, aspect='auto')
+    ax5.set_title(f'Predicted Activity\\n(Non-background Sum)', fontsize=12, fontweight='bold')
+    ax5.set_xlabel('Azimuth bins')
+    ax5.set_ylabel('Elevation bins')
+    plt.colorbar(im5, ax=ax5, label='Activity')
+    
+    ax6 = fig.add_subplot(gs[current_row, 1])
+    im6 = ax6.imshow(pred_class.numpy(), cmap=cmap_class, aspect='auto', vmin=0, vmax=M-1)
+    ax6.set_title(f'Predicted Classes\\n({int(pred_event_mask.sum())} active cells)', 
+                  fontsize=12, fontweight='bold')
+    ax6.set_xlabel('Azimuth bins')
+    ax6.set_ylabel('Elevation bins')
+    plt.colorbar(im6, ax=ax6, label='Class ID', ticks=range(0, M, 2))
+    
+    # Confidence map
+    ax7 = fig.add_subplot(gs[current_row, 2])
+    confidence = pred_grid.max(dim=-1)[0]  # Max probability across classes
+    im7 = ax7.imshow(confidence.numpy(), cmap='viridis', aspect='auto', vmin=0, vmax=1)
+    ax7.set_title('Prediction Confidence\\n(Max Probability)', fontsize=12, fontweight='bold')
+    ax7.set_xlabel('Azimuth bins')
+    ax7.set_ylabel('Elevation bins')
+    plt.colorbar(im7, ax=ax7, label='Confidence')
+    
+    # Prediction statistics
+    ax8 = fig.add_subplot(gs[current_row, 3])
+    ax8.axis('off')
+    pred_stats = f"""Prediction Statistics:
+    
+Total Cells: {I * J}
+Active Cells: {int(pred_event_mask.sum())}
+Background Cells: {int((~pred_event_mask).sum())}
+Activity Range: [{pred_nonbg.min():.3f}, {pred_nonbg.max():.3f}]
+Avg Confidence: {confidence.mean():.3f}
+Max Confidence: {confidence.max():.3f}
+    """
+    ax8.text(0.1, 0.5, pred_stats, fontsize=11, verticalalignment='center', family='monospace')
+    
+    current_row += 1
+    
+    # ========== Row: Mask (if using masked loss) ==========
+    if mask_grid is not None:
+        ax9 = fig.add_subplot(gs[current_row, 0])
+        im9 = ax9.imshow(mask_grid.numpy(), cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+        ax9.set_title('Loss Mask\\n(1=Included, 0=Excluded)', fontsize=12, fontweight='bold')
+        ax9.set_xlabel('Azimuth bins')
+        ax9.set_ylabel('Elevation bins')
+        plt.colorbar(im9, ax=ax9, label='Mask Value')
+        
+        # Show which cells are positive/negative
+        ax10 = fig.add_subplot(gs[current_row, 1])
+        pos_neg_map = torch.zeros_like(mask_grid)
+        pos_neg_map[true_event_mask] = 2  # Positives (events)
+        pos_neg_map[(~true_event_mask) & (mask_grid > 0)] = 1  # Sampled negatives
+        pos_neg_cmap = plt.matplotlib.colors.ListedColormap(['white', 'yellow', 'green'])
+        im10 = ax10.imshow(pos_neg_map.numpy(), cmap=pos_neg_cmap, aspect='auto', vmin=0, vmax=2)
+        ax10.set_title('Mask Composition\\n(Green=Pos, Yellow=Sampled Neg, White=Ignored)', 
+                       fontsize=12, fontweight='bold')
+        ax10.set_xlabel('Azimuth bins')
+        ax10.set_ylabel('Elevation bins')
+        
+        # Mask statistics
+        ax11 = fig.add_subplot(gs[current_row, 2:4])
+        ax11.axis('off')
+        num_pos = true_event_mask.sum().item()
+        num_sampled_neg = ((~true_event_mask) & (mask_grid > 0)).sum().item()
+        num_ignored = ((~true_event_mask) & (mask_grid == 0)).sum().item()
+        mask_ratio = num_sampled_neg / num_pos if num_pos > 0 else 0
+        
+        mask_stats = f"""Masked Loss Statistics:
+        
+Mask Configuration:
+  BG Ratio Setting: {criterion.mask_bg_ratio:.1f}
+  Actual BG Ratio: {mask_ratio:.1f}
+
+Mask Composition:
+  Positive Samples (Events): {num_pos}
+  Sampled Negatives (BG): {num_sampled_neg}
+  Ignored Negatives (BG): {num_ignored}
+  Total in Loss: {num_pos + num_sampled_neg}
+  Total Ignored: {num_ignored}
+
+Coverage:
+  Included: {(mask_grid.sum() / (I * J) * 100):.1f}%
+  Excluded: {((1 - mask_grid.sum() / (I * J)) * 100):.1f}%
+        """
+        ax11.text(0.1, 0.5, mask_stats, fontsize=11, verticalalignment='center', family='monospace')
+        
+        current_row += 1
+    
+    # ========== Row: Truncated Loss (if using truncated L1) ==========
+    if trunc_class_grid is not None:
+        ax12 = fig.add_subplot(gs[current_row, 0])
+        im12 = ax12.imshow(trunc_class_grid.numpy(), cmap='plasma', aspect='auto')
+        ax12.set_title(f'Truncated L1: Class Sparsity\\n(Thresh={criterion.trunc_thresh_class})', 
+                       fontsize=12, fontweight='bold')
+        ax12.set_xlabel('Azimuth bins')
+        ax12.set_ylabel('Elevation bins')
+        plt.colorbar(im12, ax=ax12, label='Penalty')
+        
+        ax13 = fig.add_subplot(gs[current_row, 1])
+        im13 = ax13.imshow(trunc_spatial_grid.numpy(), cmap='plasma', aspect='auto')
+        ax13.set_title(f'Truncated L1: Spatial Sparsity\\n(Thresh={criterion.trunc_thresh_spatial})', 
+                       fontsize=12, fontweight='bold')
+        ax13.set_xlabel('Azimuth bins')
+        ax13.set_ylabel('Elevation bins')
+        plt.colorbar(im13, ax=ax13, label='Penalty')
+        
+        # Truncation statistics
+        ax14 = fig.add_subplot(gs[current_row, 2:4])
+        ax14.axis('off')
+        trunc_stats = f"""Truncated L1 Loss Statistics:
+        
+Class-wise Sparsity:
+  Total Penalty: {trunc_class_grid.sum():.4f}
+  Mean Penalty/Cell: {trunc_class_grid.mean():.4f}
+  Max Penalty/Cell: {trunc_class_grid.max():.4f}
+  Cells Above Thresh: {(trunc_class_grid >= criterion.trunc_thresh_class).sum()}
+
+Spatial Sparsity:
+  Total Penalty: {trunc_spatial_grid.sum():.4f}
+  Mean Penalty/Cell: {trunc_spatial_grid.mean():.4f}
+  Max Penalty/Cell: {trunc_spatial_grid.max():.4f}
+  Cells Above Thresh: {(trunc_spatial_grid >= criterion.trunc_thresh_spatial).sum()}
+
+Effect: Encourages fewer active classes per cell
+        and fewer active cells per frame.
+        """
+        ax14.text(0.1, 0.5, trunc_stats, fontsize=11, verticalalignment='center', family='monospace')
+    
+    # Overall title
+    loss_type_str = f"{criterion.loss_type.upper()}"
+    if criterion.use_masked_loss:
+        loss_type_str += " + Masked Loss"
+    if criterion.w_trunc_l1 > 0:
+        loss_type_str += " + Truncated L1"
+    
+    fig.suptitle(
+        f'Mask & Prediction Visualization - Epoch {epoch} | Loss Type: {loss_type_str}\\n'
+        f'Batch {b_idx}, Frame {t_idx}',
+        fontsize=16,
+        fontweight='bold',
+        y=0.995
+    )
+    
+    # Save figure
+    save_path = os.path.join(save_dir, f'mask_pred_visualization_epoch_{epoch:03d}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    logger.info(f"Mask/prediction visualization saved to {save_path}")
+    
+    plt.close(fig)
+    
+    return save_path
+
+
 def visualize_grid_predictions(
     ground_truth,
     predictions,

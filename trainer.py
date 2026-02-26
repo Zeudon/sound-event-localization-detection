@@ -15,7 +15,7 @@ from model_conformer import SELD_Conformer
 from resnet50_model import SELD_ResNet50_Conformer
 from loss import SMRSELDLoss
 from utils import safe_torch_load
-from visualization import plot_loss_curves, visualize_loss_components, visualize_grid_predictions
+from visualization import plot_loss_curves, visualize_loss_components, visualize_grid_predictions, visualize_mask_and_preds
 
 logger = logging.getLogger('SMR_SELD')
 config = Config()
@@ -314,29 +314,47 @@ def train_model(
             gc.collect()
             logger.info(f"  GPU memory cleared")
         
-        # Visualize loss components every 5 epochs
-        # if epoch % 5 == 0:
-        #     logger.info(f"  Generating loss visualization for epoch {epoch}...")
-        #     try:
-        #         # Get a batch from test loader for visualization
-        #         model.eval()
-        #         with torch.no_grad():
-        #             for spectrograms, labels in test_loader:
-        #                 spectrograms = spectrograms.to(device, non_blocking=True)
-        #                 labels = labels.to(device, non_blocking=True)
-        #                 predictions = model(spectrograms)
-        #                 
-        #                 # Visualize first batch only
-        #                 visualize_loss_components(
-        #                     predictions, 
-        #                     labels, 
-        #                     criterion, 
-        #                     epoch,
-        #                     save_dir=str(config.OUTPUT_PATH / 'train_visualizations')
-        #                 )
-        #                 break  # Only visualize one batch
-        #     except Exception as e:
-        #         logger.warning(f"  Could not generate loss visualization: {e}")
+        
+        # Visualize predictions and mask every N epochs
+        if epoch % config.VISUALIZE_EVERY_N_EPOCHS == 0:
+            logger.info(f"  Generating mask/prediction visualization for epoch {epoch}...")
+            try:
+                # Use a batch from test loader
+                model.eval()
+                with torch.no_grad():
+                    # Find a batch with events - iterate until we find a good frame
+                    found_events = False
+                    for spectrograms, labels in test_loader:
+                        spectrograms = spectrograms.to(device, non_blocking=True)
+                        labels = labels.to(device, non_blocking=True)
+                        predictions = model(spectrograms)
+                        
+                        # Check if batch has frames with sufficient events (at least 3 active cells)
+                        y_true_indices = torch.argmax(labels, dim=-1)  # (B, T, G)
+                        background_idx = config.NUM_CLASSES - 1
+                        event_mask = (y_true_indices != background_idx).float()  # (B, T, G)
+                        event_counts = event_mask.sum(dim=-1)  # (B, T) - events per frame
+                        
+                        # Check if any frame has at least 3 events
+                        has_good_frame = (event_counts >= 3).any()
+                        
+                        if has_good_frame:
+                            visualize_mask_and_preds(
+                                predictions,
+                                labels,
+                                criterion,
+                                epoch,
+                                save_dir=str(config.OUTPUT_PATH / 'train_visualizations')
+                            )
+                            found_events = True
+                            break  # Visualize one batch/frame and stop
+                    
+                    if not found_events:
+                        logger.warning(f"  No frames with sufficient events found for visualization")
+            except Exception as e:
+                logger.warning(f"  Could not generate visualization: {e}")
+                import traceback
+                logger.warning(traceback.format_exc())
         
         if epochs_without_improvement >= config.PATIENCE:
             logger.info(f"\n{'='*80}")
@@ -359,12 +377,7 @@ def train_model(
     logger.info("\nGenerating loss curves...")
     loss_curve_path = config.OUTPUT_PATH / f"loss_curves_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
     plot_loss_curves(train_losses, test_losses, save_path=loss_curve_path)
-    
-    logger.info("\nLoading best model weights...")
-    best_checkpoint = safe_torch_load(config.CHECKPOINT_PATH / "best_model.pth")
-    model.load_state_dict(best_checkpoint['model_state_dict'])
-    logger.info(f"Best model loaded from epoch {best_checkpoint['epoch']}")
-    
+
     history = {
         'train_losses': train_losses,
         'test_losses': test_losses,
@@ -384,11 +397,25 @@ def train_model(
     history_path = config.OUTPUT_PATH / f"training_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
     torch.save(history, history_path)
     logger.info(f"Training history saved to {history_path}")
-    
+
+    # ── Free all training-only memory before returning ───────────────────
+    # optimizer (Adam: 2 momentum buffers per param ≈ same size as model)
+    # scheduler, and any remaining gradients are no longer needed.
+    # The dataloaders are NOT touched – they are owned by the caller.
+    logger.info("Freeing optimizer, scheduler and gradient buffers...")
+    optimizer.zero_grad(set_to_none=True)
+    del optimizer, scheduler
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info(f"GPU memory after cleanup: "
+                    f"{torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated, "
+                    f"{torch.cuda.memory_reserved() / 1024**3:.2f} GB reserved")
+
     logger.info("\n" + "="*80)
     logger.info("ALL DONE!")
     logger.info("="*80 + "\n")
-    
+
     return model, history
 
 def test_model(
@@ -640,11 +667,10 @@ def test_model(
         logger.warning("No frames with active events found! Cannot create visualizations.")
         return {
             'test_loss': avg_test_loss,
-            'class_mse': avg_test_class_mse,
-            # 'aiur': avg_test_aiur,
-            # 'cl': avg_test_cl,
+            f'class_{config.LOSS_TYPE}': avg_test_class_loss,
             'overall_accuracy': overall_accuracy,
             'non_bg_accuracy': non_bg_accuracy,
+            'num_frames_with_events': 0,
             'visualizations': []
         }
     
