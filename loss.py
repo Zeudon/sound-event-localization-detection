@@ -6,12 +6,21 @@ import math
 class SMRSELDLoss(nn.Module):
     """Complete SMR-SELD loss function with three components"""
 
-    def __init__(self, loss_type='ce', w_class=1.0, w_aiur=0.5, w_cl=0.5, grid_size=None, class_weights=None):
+    def __init__(self, loss_type='ce', w_class=1.0, w_aiur=0.5, w_cl=0.5, 
+                 w_trunc_l1=0.0, trunc_thresh_class=0.2, trunc_thresh_spatial=0.2,
+                 use_masked_loss=False, mask_bg_ratio=3.0,
+                 grid_size=None, class_weights=None):
         super().__init__()
         self.loss_type = loss_type
         self.w_class = w_class
         self.w_aiur = w_aiur
         self.w_cl = w_cl
+        self.w_trunc_l1 = w_trunc_l1
+        self.trunc_thresh_class = trunc_thresh_class
+        self.trunc_thresh_spatial = trunc_thresh_spatial
+        self.use_masked_loss = use_masked_loss
+        self.mask_bg_ratio = mask_bg_ratio
+        
         self.eps = 1e-10  # Small epsilon for numerical stability
         if grid_size is not None:
             self.I, self.J = grid_size
@@ -20,38 +29,155 @@ class SMRSELDLoss(nn.Module):
             
         # Initialize CrossEntropyLoss with weights if provided
         if class_weights is not None:
-            self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
+            self.ce_loss = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
         else:
-            self.ce_loss = nn.CrossEntropyLoss()
-    
-    def class_ce_loss(self, y_pred, y_true):
-        """Class-wise Cross Entropy loss
-        y_pred: (B, T, G, M) - Logits
-        y_true: (B, T, G, M) - One-hot encoded targets
+            self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+            
+    def truncated_l1_loss(self, y_pred):
         """
-        # Convert one-hot targets to class indices
+        Truncated L1 regularization loss.
+        y_pred: (B, T, G, M) - Logits
+
+        Goal: promote spatially sparse event predictions without reinforcing
+        the background-collapse problem.
+
+        Component 1 – CLASS sparsity (per active cell):
+            Penalise the BACKGROUND probability when it is too high, i.e.
+            push the model away from assigning near-1.0 background confidence
+            to every cell.  Penalty = min(p_bg, trunc_thresh_class).
+            This creates a gentle gradient that discourages total background
+            collapse while staying bounded (no exploding gradients).
+
+        Component 2 – SPATIAL sparsity (per frame):
+            Penalise frames where the total predicted event-activity
+            (sum of non-background probs across all cells) exceeds a
+            threshold.  This is the original intent – few active cells –
+            but applied only *above* the threshold so it never rewards
+            predicting background everywhere.
+            Penalty = max(0, cell_activity_total - trunc_thresh_spatial).
+        """
+        probs = F.softmax(y_pred, dim=-1)  # (B, T, G, M)
+
+        # 1. Class sparsity: penalise over-confident background predictions
+        #    p_bg close to 1.0 means the model is collapsing → push back.
+        p_bg = probs[..., -1]  # (B, T, G)
+        trunc_class = torch.min(
+            p_bg,
+            torch.tensor(self.trunc_thresh_class, device=p_bg.device)
+        )
+        loss_sparsity_class = trunc_class.mean()
+
+        # 2. Spatial sparsity: penalise excess event activity per frame
+        #    (too many cells active at once), but never reward zero activity.
+        probs_events = probs[..., :-1]  # (B, T, G, M-1)
+        cell_activity = probs_events.sum(dim=-1)  # (B, T, G)  – per-cell activity
+        total_activity_per_frame = cell_activity.sum(dim=-1)   # (B, T)
+
+        excess = torch.clamp(
+            total_activity_per_frame - self.trunc_thresh_spatial,
+            min=0.0
+        )
+        loss_sparsity_spatial = excess.mean()
+
+        return loss_sparsity_class + loss_sparsity_spatial
+
+    def get_mask_indices(self, y_true):
+        """
+        Generate mask to sample all positives and ratio*positives negatives
+        y_true: (B, T, G, M) one-hot
+        """
+        B, T, G, M = y_true.shape
+        background_idx = M - 1
+        
         y_true_indices = torch.argmax(y_true, dim=-1) # (B, T, G)
         
-        # Reshape for CrossEntropyLoss: (N, C) vs (N)
-        # Flatten batch, time, and grid dimensions
-        B, T, G, M = y_pred.shape
-        y_pred_flat = y_pred.view(-1, M) # (B*T*G, M)
-        y_true_flat = y_true_indices.view(-1) # (B*T*G)
+        # Positive mask: where class is NOT background
+        pos_mask = (y_true_indices != background_idx) # (B, T, G)
         
-        ce_loss = self.ce_loss(y_pred_flat, y_true_flat)
-        return ce_loss
+        # Negative mask: where class IS background
+        neg_mask = (y_true_indices == background_idx) # (B, T, G)
+        
+        # Flat indices
+        pos_indices = torch.nonzero(pos_mask.view(-1), as_tuple=True)[0]
+        neg_indices = torch.nonzero(neg_mask.view(-1), as_tuple=True)[0]
+        
+        num_pos = pos_indices.numel()
+        num_neg = neg_indices.numel()
+        
+        # Determine how many negatives to keep
+        if num_pos > 0:
+            num_keep_neg = int(num_pos * self.mask_bg_ratio)
+            num_keep_neg = min(num_neg, num_keep_neg)
+        else:
+            # If no positives, maybe keep a small fraction of negatives or just 0?
+            # Let's keep a small fixed amount to learn pure background?
+            # Or just keep 0? If 0, loss is 0 for this batch.
+            # Let's keep 10% of negatives if no positives found, just to have some signal.
+            num_keep_neg = max(1, int(num_neg * 0.01))
+            
+        # Randomly sample negatives
+        if num_keep_neg < num_neg and num_neg > 0:
+            perm = torch.randperm(num_neg, device=neg_indices.device)
+            keep_neg_indices = neg_indices[perm[:num_keep_neg]]
+        else:
+            keep_neg_indices = neg_indices
+            
+        # Combine
+        combined_indices = torch.cat([pos_indices, keep_neg_indices])
+        
+        return combined_indices
+
+    def class_ce_loss(self, y_pred, y_true):
+        """Class-wise Cross Entropy loss"""
+        y_true_indices = torch.argmax(y_true, dim=-1) # (B, T, G)
+        
+        B, T, G, M = y_pred.shape
+        y_pred_flat = y_pred.view(-1, M) # (N, M)
+        y_true_flat = y_true_indices.view(-1) # (N)
+        
+        if self.use_masked_loss:
+            mask_indices = self.get_mask_indices(y_true)
+            
+            if mask_indices.numel() == 0:
+                return torch.tensor(0.0, device=y_pred.device, require_grad=True)
+                
+            y_pred_masked = y_pred_flat[mask_indices]
+            y_true_masked = y_true_flat[mask_indices]
+            
+            # Loss is already reduced='none' in init
+            loss = self.ce_loss(y_pred_masked, y_true_masked)
+            return loss.mean()
+        else:
+            # Fallback for full loss, but self.ce_loss is 'none' now, so we mean it manually
+            loss = self.ce_loss(y_pred_flat, y_true_flat)
+            return loss.mean()
 
     def class_mse_loss(self, y_pred, y_true):
-        """Class-wise Mean Squared Error loss
-        y_pred: (B, T, G, M) - Logits
-        y_true: (B, T, G, M) - One-hot encoded targets
-        """
-        # Apply Softmax to get probabilities
+        """Class-wise Mean Squared Error loss"""
         y_pred_probs = F.softmax(y_pred, dim=-1)
         
-        # MSE Loss
-        mse_loss = F.mse_loss(y_pred_probs, y_true)
-        return mse_loss
+        if self.use_masked_loss:
+            # Use same masking logic
+            # MSE requires matching dimensions
+            B, T, G, M = y_pred.shape
+            y_pred_flat = y_pred_probs.view(-1, M)
+            y_true_flat = y_true.view(-1, M)
+            
+            mask_indices = self.get_mask_indices(y_true)
+            
+            if mask_indices.numel() == 0:
+                 return torch.tensor(0.0, device=y_pred.device, requires_grad=True)
+            
+            y_pred_masked = y_pred_flat[mask_indices]
+            y_true_masked = y_true_flat[mask_indices]
+            
+            mse_loss = F.mse_loss(y_pred_masked, y_true_masked)
+            return mse_loss
+            
+        else:
+            # MSE Loss
+            mse_loss = F.mse_loss(y_pred_probs, y_true)
+            return mse_loss
     
     def aiur_loss(self, y_pred, y_true):
         """Area Intersection Union Ratio (AIUR) loss computed per frame and batch.
@@ -160,13 +286,21 @@ class SMRSELDLoss(nn.Module):
         # loss_aiur = self.aiur_loss(y_pred_probs, y_true)
         # loss_cl = self.converging_localization_loss(y_pred_probs, y_true)
         
-        # total_loss = (self.w_class * loss_class +
-        #               self.w_aiur * loss_aiur +
-        #               self.w_cl * loss_cl)
-        total_loss = self.w_class * loss_class  
+        total_loss = self.w_class * loss_class
+        
+        # Add Truncated L1 Loss
+        loss_trunc = torch.tensor(0.0, device=y_pred.device)
+        if self.w_trunc_l1 > 0:
+            loss_trunc = self.truncated_l1_loss(y_pred)
+            total_loss += self.w_trunc_l1 * loss_trunc
+            
         breakdown = {
             f'class_{self.loss_type}': float(loss_class.item()),
             # 'aiur': float(loss_aiur.item()),
             # 'cl': float(loss_cl.item())
         }
+        
+        if self.w_trunc_l1 > 0:
+            breakdown['trunc_l1'] = float(loss_trunc.item())
+            
         return total_loss, breakdown
